@@ -1,0 +1,792 @@
+import sys, os
+# Absolute path to THIS repo (fingerprint_bachelor/DetectingVocoderFingerprints)
+# repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+
+# Wipe out any other conflicting paths containing "src"
+# sys.path = [repo_root] + [p for p in sys.path if "github_fingerprint" not in p]
+
+# If "src" is already loaded from the wrong repo, drop it
+# if "src" in sys.modules:
+#     del sys.modules["src"]
+
+import random
+import subprocess
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+import numpy as np
+import torch
+import pandas as pd
+import click
+from datetime import datetime
+from torch import no_grad, argmax, save
+from torchmetrics import F1Score, Precision, Recall, Accuracy, ConfusionMatrix, AUROC
+from torch.nn import DataParallel
+from tqdm import tqdm
+from tabulate import tabulate
+from torch.utils.data import DataLoader
+from torch import Generator
+from src.datasets.utility import collate_fn as nonfing_collate_fn
+from src.datasets.utility import get_datasets, StratifiedSampler, fingerprints_collate_fn, SNR
+from src.training.utility import get_model, get_optimizer_scheduler_loss_function, get_metric, save_confusion_matrix_to_excel, save_heatmap, set_seed
+from src.training.invariables import DEV, DEVICE_IDS, CLASSES, DATASETS
+from src.training.arguments import MODELS, CLASSIFICATION_TYPES, PERFORMANCE_METRICS
+import re
+import torch.multiprocessing as mp
+import gc
+from src.training.loss_functions import init_loss_functions
+# from src.datasets.filters import filter_fn
+from src.fingerprinting.fingerprinting import load_fingerprints, compute_mahalanobis_scores, assign_vocoders, WaveformToAvgSpec, assign_score, evasion_attack_scores, pgd_attack, strong_pgd_attack
+import torch.nn as nn
+from scipy.stats import norm
+from src.fingerprinting.filters import filter_fn
+from sklearn.metrics import roc_curve, f1_score as f1_function
+import torchaudio
+import csv
+
+
+@click.command()
+# Dataset selection: ljspeech, jsut, or asvspoof
+@click.option('--corpus', type=click.Choice(["ljspeech", "jsut", "asvspoof", "codecfake"]), required=True, default="ljspeech", help="Dataset corpus to use.")
+# Filter configuration
+@click.option('--filter_type', type=click.Choice(["low_pass_filter", "band_pass_filter"]), required=True, default="low_pass_filter", help="Type of filter to apply to the audio signal.")
+@click.option('--filter_param', type=str, default=1, required=True, help="Parameter of the filter.")
+@click.option('--scorefunction', type=click.Choice(["mahalanobis", "correlation"]), required=True, default="mahalanobis", help="Type of scoring function to use.")
+# Data and processing paths
+@click.option("--window_size", type=float, default=8, help="STFT window size (in milliseconds), i.e., the duration of each analysis frame.")
+@click.option("--hop_size", type=float, default=0.125, help="STFT hop size (in milliseconds), i.e., the step between consecutive frames.")
+@click.option('--seed', type=int, default=40, help='Random seed.')
+
+# Model setting
+@click.option('--model', type=click.Choice(MODELS), required=True, help='Model to train.')
+@click.option('--classification_type', type=click.Choice(CLASSIFICATION_TYPES), required=True, help='Classification type.')
+@click.option('--performance_metric', type=click.Choice(PERFORMANCE_METRICS), default="f1_score", help='Performance metric.')
+@click.option('--corruption_type', type=int, default=0, help='Evaluate under evasion attack: 0 = no evasion attack, 1 = evasion attack')
+@click.option('--use_nn', type=int, default=1, help='Set to 1 to use a DNN for the binary classifier under the fingerprint model, 0 to disable.')
+
+# Additional processing details
+@click.option('--scale_factor', type=float, default=1.0, help='It compresses or dilates the given impulse response.') 
+@click.option('--epochs', type=int, default=10, help='Number of epochs.')
+@click.option('--num_workers_opt', type=int, default=4, help='how many subprocesses to use for data loading. 0 means that the data will be loaded in the main process.')
+@click.option('--batchsize', type=int, default=100, help='Adjust batch size as needed.')
+
+        
+def main(corpus, filter_type, filter_param, scorefunction, window_size, hop_size, seed, model, classification_type, performance_metric, corruption_type, use_nn, scale_factor, epochs, num_workers_opt, batchsize):   # save_id
+
+    set_seed(seed)
+    init_loss_functions(seed)
+
+    # Get Dataloader
+    if corpus == "jsut":
+        sample_rate = 24000
+    elif corpus == "ljspeech":
+        sample_rate = 22050
+    else:
+        sample_rate = 16000
+    
+    nfft = int((window_size / 1000) * sample_rate)
+    hop_len = int((hop_size / 1000) * sample_rate)
+    # Set up directory where to save model and logs
+    BASE_DIR = os.getcwd()
+    URL_DIR_TO_SAVE_MODELS_AND_LOGS = os.path.join(BASE_DIR, "trained_models") 
+    url_dir_to_save_model = f'{URL_DIR_TO_SAVE_MODELS_AND_LOGS}/{model}/{corpus}/{seed}/{filter_type}/{classification_type}_filparm_{filter_param}_nfft_{nfft}_hop_{hop_len}'
+    MEAN_STD_FOLDER_DIR = os.path.join(BASE_DIR, "mean_std_stats", corpus, filter_type, f"{classification_type}_filparm_{filter_param}_nfft_{nfft}_hop_{hop_len}") 
+    
+    x = []
+    if isinstance(filter_param, float): 
+        # Convert to int and then to string
+        filter_param = int(filter_param) if filter_param.is_integer() else filter_param 
+    file_in = open(f"spectral_filter_coefs/{filter_type}/{filter_param}khz.txt", 'r')
+
+    for y in file_in.read().split('\n'):
+        x.append(float(y))
+    coef = torch.tensor(x)
+
+    audio_filter = filter_fn(1, coef, filter_type)
+    transformation = WaveformToAvgSpec(window_size=window_size, hop_size=hop_size, sample_rate=sample_rate, device=DEV)
+
+    if not os.path.exists(url_dir_to_save_model):
+        os.makedirs(url_dir_to_save_model)
+
+    train_ds, validate_ds, test_ds, test_2_ds = get_datasets(
+        model=model,
+        classification_type=classification_type, 
+        seed=seed,
+        corruption_type=corruption_type, 
+        scale_factor=scale_factor, 
+        corpus=corpus,
+        mean_std_dir=MEAN_STD_FOLDER_DIR,
+        sample_rate=sample_rate,
+        coef=coef,
+        n_fft=nfft, 
+        hop_length=hop_len
+        )
+
+    if model in ["fingerprint", "fingerprint_2"]:
+        collate_fn = fingerprints_collate_fn
+    else:
+        collate_fn = nonfing_collate_fn
+
+    generator = Generator().manual_seed(seed)
+
+    num_classes = len(CLASSES[classification_type][corpus]) # int(re.findall(pattern=r'\d+', string=classification_type)[0])
+    # Set up Metrics
+    if "binary" in classification_type:
+        task = "binary"
+        accuracy = Accuracy(task=task).to(DEV)
+        f1 = F1Score(task=task).to(DEV)
+        precision = Precision(task=task).to(DEV)
+        recall = Recall(task=task).to(DEV)
+        confusion_matrix = ConfusionMatrix(task=task).to(DEV)
+        auroc = AUROC(task=task).to(DEV)
+        prob_func = torch.nn.functional.sigmoid
+        preds_func = lambda signals: (signals > 0.5).long()
+    else:
+        task = "multiclass"
+        accuracy = Accuracy(task=task, num_classes=num_classes).to(DEV)
+        f1 = F1Score(task=task, num_classes=num_classes, average="macro").to(DEV)
+        precision = Precision(task=task, num_classes=num_classes, average="macro").to(DEV)
+        recall = Recall(task=task, num_classes=num_classes, average="macro").to(DEV)
+        confusion_matrix = ConfusionMatrix(task=task, num_classes=num_classes).to(DEV)
+        auroc = AUROC(task=task, num_classes=num_classes, average="macro").to(DEV)
+        prob_func = lambda signals: torch.nn.functional.softmax(signals, dim=1)
+        preds_func = lambda signals: argmax(signals, dim=1)
+    
+    print(f'num_classes: {num_classes}')
+    
+    # --- DataLoader setup ---
+    sampler = None
+    shuffle = True
+
+    train_loader = DataLoader(train_ds, batch_size=batchsize, num_workers=num_workers_opt, persistent_workers=False, pin_memory=True, generator=generator, collate_fn=collate_fn, shuffle=shuffle, sampler=sampler)
+    validation_loader = DataLoader(validate_ds, batch_size=batchsize, num_workers=num_workers_opt, persistent_workers=False, pin_memory=True, generator=generator, collate_fn=collate_fn)
+
+    # run vocoder_fingerprint_attribution.py if model == fingerprints and classification_type is multiclass
+    if model != "fingerprint" or (model == "fingerprint" and use_nn == 1) or (model == "fingerprint_2" and use_nn == 1):
+        # Get model
+        # '''
+        if model == "fingerprint_2" :
+            my_model = get_model(model=model, classification_type=classification_type, num_classes=num_classes, input_size=nfft // 2 + 1)
+        else:
+            my_model = get_model(model=model, classification_type=classification_type, num_classes=num_classes)
+        # '''
+        # my_model = get_model(model=model, classification_type=classification_type, num_classes=num_classes)
+        my_model = DataParallel(my_model, device_ids=DEVICE_IDS).to(DEV)
+
+        # Get optimizer, scheduler and loss function
+        optimizer, scheduler, loss_function = get_optimizer_scheduler_loss_function(model=model, my_model=my_model, classification_type=classification_type)
+
+        testing_score_df = pd.DataFrame(
+            columns=["Testing_Accuracy", "Testing_F1_Score", "Testing_Precision", "Testing_Recall", "Testing_AUROC"]
+        )
+        '''
+        if os.path.exists(f'{url_dir_to_save_model}/best_model.pth'):
+            checkpoint = torch.load(f'{url_dir_to_save_model}/best_model.pth',
+                            map_location=lambda storage, loc: storage.cuda(0) if torch.cuda.is_available() else storage)
+            my_model.load_state_dict(checkpoint)
+            my_model.to(DEV)
+            print("Best model found!", url_dir_to_save_model)
+        '''
+
+        if not os.path.exists(f'{url_dir_to_save_model}/best_model.pth'):
+
+            print(f'Initializing {model} model training...')
+
+            # Create performance dataframe for training/validating
+            training_validating_score_df = pd.DataFrame(
+                columns=["Epoch", "Training_Loss", "Validating_Loss", "Training_Accuracy", 
+                        "Validating_Accuracy", "Training_F1_Score", "Validating_F1_Score", 
+                        "Training_Precision", "Validating_Precision","Training_Recall", 
+                        "Validating_Recall", "Training_AUROC", "Validating_AUROC"])
+
+            # Training loop
+            n_epochs = epochs
+            best_score = 0
+            print('Training started...')
+            
+            for epoch in tqdm(range(n_epochs), desc="Training Epochs"):
+                # Reset metrics
+                accuracy.reset(), f1.reset(), precision.reset()
+                recall.reset(), confusion_matrix.reset(), auroc.reset()
+                # === Train Phase ===
+                my_model.train()
+                running_loss = 0.0
+                train_batches = len(train_loader)
+
+                for batch  in tqdm(train_loader, desc="Training batches"):
+                    # Transfer to device
+                    if model in ["fingerprint", "fingerprint_2"]:
+                        waveforms, labels, wavs_len, path = batch
+                        waveforms, labels = waveforms.to(DEV), labels.to(DEV)
+                        filtered_audio = audio_filter.forward(waveforms)
+                        if model == "fingerprint":  
+                            avg_ = transformation.forward_4(waveforms, wavs_len)
+                            filtered_avg_ = transformation.forward_4(filtered_audio, wavs_len)
+                            # avg_ = transformation.forward_2(waveforms, wavs_len)
+                            # filtered_avg_ = transformation.forward_2(filtered_audio, wavs_len)
+                        else:
+                            avg_ = transformation.forward(waveforms, wavs_len)
+                            filtered_avg_ = transformation.forward(filtered_audio, wavs_len)
+                        inputs = avg_ - filtered_avg_
+                        inputs = torch.nan_to_num(inputs, nan=0.0)
+                    else:
+                        waveforms, labels = batch
+                        inputs, labels = waveforms.to(DEV), labels.to(DEV)
+                    if "binary" in classification_type:
+                        labels = labels.float().unsqueeze(1)
+                    else:
+                        labels = labels -1
+                    # print(labels)
+                    # print(afasfs)
+                    # print(inputs.shape)
+                    # Zero gradients
+                    optimizer.zero_grad()
+                    # Forward pass
+                    # print(inputs.shape)
+                    outputs, features = my_model(inputs)
+                    # print(outputs)
+                    loss = loss_function(outputs, features, labels)
+                    # Backward pass and optimization
+                    loss.backward()
+                    optimizer.step()
+                    # Loss, predictions and probabilities
+                    running_loss += loss.item()
+                    probabilities = prob_func(outputs)
+                    preds = preds_func(probabilities)
+                    # Accumulate metrics
+                    accuracy.update(preds, labels)
+                    f1.update(preds, labels.long())
+                    precision.update(preds, labels)
+                    recall.update(preds, labels)
+                    auroc.update(probabilities, labels)
+
+                # Get scores
+                training_loss = running_loss / train_batches
+                training_accuracy = accuracy.compute().item()
+                training_f1_score = f1.compute().item()
+                training_precesion = precision.compute().item()
+                training_recall = recall.compute().item()
+                training_auroc = auroc.compute().item()
+                # === Validation Phase ===
+                # Reset metrics
+                accuracy.reset(), f1.reset(), precision.reset()
+                recall.reset(), confusion_matrix.reset(), auroc.reset()
+                
+                my_model.eval()
+
+                # LCNN: BatchNorm collapses in evaluation because its running mean and variance are inaccurate for small batches,
+                #  especially after channel-halving operations like MFM, causing outputs to shrink even with dropout disabled.
+                if model == "lcnn":
+                    my_model.apply(set_bn_to_train)
+
+                validating_loss = 0.0
+                with torch.no_grad():
+                    for batch in tqdm(validation_loader, desc="Validation batches"):
+                        # waveforms, labels = batch
+                        # inputs, labels = waveforms.to(DEV), labels.to(DEV)
+
+                        if model in ["fingerprint", "fingerprint_2"]:
+                            waveforms, labels, wavs_len, path = batch
+                            waveforms, labels = waveforms.to(DEV), labels.to(DEV)
+                            filtered_audio = audio_filter.forward(waveforms)  
+
+                            if model == "fingerprint":
+                                avg_ = transformation.forward_4(waveforms, wavs_len)
+                                filtered_avg_ = transformation.forward_4(filtered_audio, wavs_len)
+                            else:
+                                avg_ = transformation.forward(waveforms, wavs_len)
+                                filtered_avg_ = transformation.forward(filtered_audio, wavs_len)
+
+                            inputs = avg_ - filtered_avg_ 
+                            inputs = torch.nan_to_num(inputs, nan=0.0)
+                        else:
+                            waveforms, labels = batch
+                            inputs, labels = waveforms.to(DEV), labels.to(DEV)
+                            
+                        if "binary" in classification_type:
+                            labels = labels.float().unsqueeze(1)
+                        else:
+                            labels = labels -1
+                        # Forward pass
+                        outputs, features = my_model(inputs)
+                        loss = loss_function(outputs, features, labels)
+                        # loss, predictions and probabilities
+                        validating_loss += loss.item()                
+                        probabilities = prob_func(outputs)
+                        preds = preds_func(probabilities)
+                        # Accumulate metrics
+                        accuracy.update(preds, labels)
+                        f1.update(preds, labels.long())
+                        precision.update(preds, labels)
+                        recall.update(preds, labels)                    
+                        auroc.update(probabilities, labels)
+
+                # Get training_validating scores
+                validating_loss = validating_loss / len(validation_loader)
+                validating_accuracy = accuracy.compute().item()
+                validating_f1_score = f1.compute().item()
+                validating_precision = precision.compute().item()
+                validating_recall = recall.compute().item()
+                validating_auroc = auroc.compute().item()
+                # Save training_validating scores to dict
+                training_validating_scores_dict = {
+                    "Epoch": epoch+1,
+                    "Training_Loss": training_loss,
+                    "Validating_Loss": validating_loss,
+                    "Training_Accuracy": training_accuracy,
+                    "Validating_Accuracy": validating_accuracy,
+                    "Training_F1_Score": training_f1_score,
+                    "Validating_F1_Score": validating_f1_score,
+                    "Training_Precision": training_precesion,
+                    "Validating_Precision": validating_precision,
+                    "Training_Recall": training_recall,
+                    "Validating_Recall": validating_recall,
+                    "Training_AUROC": training_auroc,
+                    "Validating_AUROC": validating_auroc
+                }
+                # Add training_validating scores to dataframe 
+                training_validating_score_df.loc[len(training_validating_score_df)] = training_validating_scores_dict
+                # Save the best model based on validation F1 score
+                metric = get_metric(performance_metric)
+                if training_validating_scores_dict[metric] > best_score:
+                    best_score = training_validating_scores_dict[metric]
+                    print("\n\nNew best model found! Saving...")
+                    save(my_model.state_dict(), f'{url_dir_to_save_model}/best_model.pth')
+                    save(scheduler.state_dict(), f'{url_dir_to_save_model}/scheduler.pth')
+                    save(optimizer.state_dict(), f'{url_dir_to_save_model}/optimizer.pth')
+                # Scheduler step
+                #if model in ["resnet", "se-resnet", "lcnn", "x-vector"]:
+                scheduler.step()
+                #print(f'Learning rate at epoch {epoch}: {scheduler.get_last_lr()}')
+                # Print Metrics
+                print("\n")
+                table = [[key, value] for key, value in training_validating_scores_dict.items()]
+                print(tabulate(table, headers=["Metric", "Value"], tablefmt="grid"))
+                print("\n")
+            print("\nTraining Completed.")
+            del train_loader
+            del validation_loader
+            gc.collect()            
+            # Add scores to dataframes
+            training_validating_score_df.loc[len(training_validating_score_df)] = training_validating_scores_dict
+            # Save scores
+            training_validating_score_df.to_excel(f'{url_dir_to_save_model}/training_validating_scores.xlsx', index=False)
+
+        # === Test Phase ===
+        print("\nTesting the best model...")
+        test_loader = DataLoader(test_ds, batch_size=batchsize, num_workers=num_workers_opt, persistent_workers=False, pin_memory=True, generator=generator, collate_fn=collate_fn)
+        # for i in tqdm(test_ds, desc="Testing batches"):
+        #  continue
+        # my_model.load_state_dict(torch.load(f'{url_dir_to_save_model}/best_model.pth'))
+        checkpoint = torch.load(f'{url_dir_to_save_model}/best_model.pth',
+                            map_location=lambda storage, loc: storage.cuda(0) if torch.cuda.is_available() else storage)
+        my_model.load_state_dict(checkpoint)
+       
+        my_model.eval()
+        
+        if model == "lcnn":
+            my_model.apply(set_bn_to_train)
+
+        # Reset Metrics
+        accuracy.reset(), f1.reset(), precision.reset()
+        recall.reset(), confusion_matrix.reset(), auroc.reset()
+
+        with no_grad():
+            for batch in tqdm(test_loader, desc="Testing batches"):
+                # waveforms, labels = batch
+                # inputs, labels = waveforms.to(DEV), labels.to(DEV)
+
+                if model in ["fingerprint", "fingerprint_2"]:
+                    waveforms, labels, wavs_len, path = batch
+                    waveforms, labels = waveforms.to(DEV), labels.to(DEV)
+                    filtered_audio = audio_filter.forward(waveforms)      
+
+                    if model == "fingerprint":
+                        avg_ = transformation.forward_4(waveforms, wavs_len)
+                        filtered_avg_ = transformation.forward_4(filtered_audio, wavs_len)
+                    else:
+                        avg_ = transformation.forward(waveforms, wavs_len)
+                        filtered_avg_ = transformation.forward(filtered_audio, wavs_len)
+
+                    inputs = avg_ - filtered_avg_ 
+                    inputs = torch.nan_to_num(inputs, nan=0.0)
+                else:
+                    waveforms, labels = batch
+                    inputs, labels = waveforms.to(DEV), labels.to(DEV)
+                    
+                if "binary" in classification_type:
+                    labels = labels.float().unsqueeze(1)
+                else:
+                    labels = labels -1     
+                # print(inputs.shape)               
+                # Forward pass
+                outputs, features = my_model(inputs)
+                probabilities = prob_func(outputs)
+                preds = preds_func(probabilities)
+                # Update Metrics
+                accuracy.update(preds, labels)
+                f1.update(preds, labels.long())
+                precision.update(preds, labels)
+                recall.update(preds, labels)
+                confusion_matrix.update(preds, labels)
+                auroc.update(probabilities, labels)                
+                # '''
+        # Get test scores
+        testing_accuracy = accuracy.compute().item()
+        testing_f1_score = f1.compute().item()
+        testing_precision = precision.compute().item()
+        testing_recall = recall.compute().item()
+        testing_confusion_matrix = confusion_matrix.compute()
+        testing_auroc = auroc.compute().item()    
+        # Save test scores to dict
+        testing_scores_dict = {
+            "Testing_Accuracy": testing_accuracy,
+            "Testing_F1_Score": testing_f1_score,
+            "Testing_Precision": testing_precision,
+            "Testing_Recall": testing_recall,
+            "Testing_AUROC": testing_auroc,
+        }
+        # Print test metrics
+        print("\n")
+        table = [[key, value] for key, value in testing_scores_dict.items()]
+        print(tabulate(table, headers=["Metric", "Value"], tablefmt="grid"))
+        print("\n")        
+        # Add scores to dataframes
+        testing_score_df.loc[len(testing_score_df)] = testing_scores_dict
+        # Save scores
+        testing_score_df.to_excel(f'{url_dir_to_save_model}/testing_scores_{corruption_type}_factor{scale_factor}_NN{use_nn}.xlsx', index=False)
+        save_confusion_matrix_to_excel(conf_matrix=testing_confusion_matrix, destination_url=url_dir_to_save_model, classification_type=classification_type, corruption_type=corruption_type, scale_factor=scale_factor, corpus=corpus)
+        save_heatmap(conf_matrix=testing_confusion_matrix.cpu().numpy(), destination_url=url_dir_to_save_model, classification_type=classification_type, corruption_type=corruption_type, scale_factor=scale_factor, corpus=corpus)
+        print("Scores saved...")
+    else:
+        print(f'Initializing fingerprints scoring...')
+        # FILTER = filter_fn(1, coef)
+        # AVG_SPEC =  WaveformToAvgSpec(window_size=window_size, hop_size=hop_size, sample_rate=sample_rate, device=DEV).forward
+        # construct command to run vocoder_fingerprint_attribution.py
+        FINGERPRINT_DIR = f'{URL_DIR_TO_SAVE_MODELS_AND_LOGS}/{model}/{corpus}/{seed}/{filter_type}'
+        # Load fingerprints
+        fingerprints = load_fingerprints(FINGERPRINT_DIR, filter_param, scorefunction, nfft, hop_len, CLASSES[classification_type][corpus], DEV)
+        all_preds = []
+        all_labels = []
+        print("Scoring initialized...")
+        test_loader = DataLoader(test_ds, batch_size=batchsize, num_workers=num_workers_opt, persistent_workers=False, pin_memory=False, generator=generator, collate_fn=collate_fn) # fingerprints_collate_fn
+        label_map_inv = {v: k for k, v in DATASETS[corpus].items()}
+        print(DATASETS[corpus].items())
+        print(label_map_inv)
+        
+        output_dir = f'{url_dir_to_save_model}/nn_{use_nn}'
+        os.makedirs(output_dir, exist_ok=True)    
+        snr_values = []
+        if classification_type == 'binary':
+            if os.path.exists(f"{output_dir}/evaluation_binary_gaussian.csv"):
+                df = pd.read_csv(f"{output_dir}/evaluation_binary_gaussian.csv")
+                
+                # Extract values
+                mean = df["mean"].iloc[0]
+                std = df["std"].iloc[0]
+                best_f1 = df["best_f1"].iloc[0]
+                best_thresh = df["best_threshold"].iloc[0]
+
+                data_gaussian = {
+                    "mean": [mean],
+                    "std": [std],
+                    "best_f1": [best_f1],
+                    "best_threshold": [best_thresh]
+                }
+            else:
+                train_preds = []
+                for batch in tqdm(train_loader, desc="Processing train samples"):
+                    waveforms, labels, wavs_len, path = batch
+                    waveforms, labels = waveforms.to(DEV), labels.to(DEV)
+                    # print(labels)
+                    waveforms = waveforms[labels == 1]
+                    # Convert lengths to tensor
+                    lengths_tensor = torch.tensor(wavs_len, device=DEV)
+                    # Apply the same mask as for wavs
+                    lengths_1 = lengths_tensor[labels == 1]
+                    # Optionally back to list
+                    wavs_len = lengths_1.tolist()
+
+                    filtered_audio = audio_filter.forward(waveforms) 
+                    # print(filtered_audio)     
+                    avg_ = transformation.forward(waveforms, wavs_len)
+                    # print(avg_)
+                    filtered_avg_ = transformation.forward(filtered_audio, wavs_len)
+                    # print(filtered_avg_)
+                    residuals = avg_ - filtered_avg_ 
+                    scores = compute_mahalanobis_scores(residuals, fingerprints, DEV)
+                    train_tensor = assign_score(scores)
+                    train_preds.append(train_tensor)
+                train_preds = torch.cat(train_preds, dim=0)
+                # print(train_preds)
+                mean, std = norm.fit(train_preds.cpu())
+
+                val_preds  = []
+                val_labels = []
+                for batch in tqdm(validation_loader, desc="Processing validation samples"):
+                    waveforms, labels, wavs_len, path = batch
+                    waveforms, labels = waveforms.to(DEV), labels.to(DEV)
+                    
+                    filtered_audio = audio_filter.forward(waveforms) 
+                    # print(filtered_audio)     
+                    avg_ = transformation.forward(waveforms, wavs_len)
+                    # print(avg_)
+                    filtered_avg_ = transformation.forward(filtered_audio, wavs_len)
+                    # print(filtered_avg_)
+                    residuals = avg_ - filtered_avg_ 
+                    scores = compute_mahalanobis_scores(residuals, fingerprints, DEV)
+                    train_tensor = assign_score(scores)
+                    val_preds.append(train_tensor)
+                    val_labels.append(labels)
+
+                val_preds = torch.cat(val_preds, dim=0)
+                val_labels = torch.cat(val_labels, dim=0)
+                thres_fitted_norm = norm.pdf(val_preds.cpu(), loc=mean, scale=std + 1e-08)
+                # print(val_preds)
+                # print(thres_fitted_norm)
+                
+                fpr, tpr, thresholds = roc_curve(val_labels.cpu(), thres_fitted_norm, drop_intermediate=False)
+
+                best_f1 = 0
+                best_thresh = 0
+
+                for thresh in thresholds:
+                    preds = (thres_fitted_norm >= thresh).astype(int)
+                    f1 = f1_function(val_labels.cpu(), preds)
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_thresh = thresh
+
+                print("Best F1:", best_f1)
+                print("Threshold that maximizes F1:", best_thresh)
+                # Create a dictionary for a single row
+                data_gaussian = {
+                    "mean": [mean],
+                    "std": [std],
+                    "best_f1": [best_f1],
+                    "best_threshold": [best_thresh]
+                }
+
+                # Convert to DataFrame
+                df = pd.DataFrame(data_gaussian)
+
+                # Save to CSV
+                df.to_csv(f"{output_dir}/evaluation_binary_gaussian.csv", index=False)
+            
+        for batch in tqdm(test_loader, desc="Processing test samples"):
+            waveforms, labels, wavs_len, path = batch
+            waveforms, labels = waveforms.to(DEV), labels.to(DEV)
+            filtered_audio = audio_filter.forward(waveforms) 
+            avg_ = transformation.forward(waveforms, wavs_len)
+            filtered_avg_ = transformation.forward(filtered_audio, wavs_len)
+            residuals = avg_ - filtered_avg_ 
+            '''
+            if original_lens is None:
+                original_lens = [waveforms.shape[-1]]
+            transformed_features = AVG_SPEC(waveforms, original_lens)
+            filtered_signals = FILTER.forward(waveforms).to(DEV)
+            transformed_filtered_features = AVG_SPEC(filtered_signals, original_lens)
+            residuals = transformed_features - transformed_filtered_features
+            '''
+            if corruption_type == 1:
+                orig_labels = labels
+                # Random replacement
+                rand_labels = torch.randint(1, num_classes + 1, labels.size(), device=labels.device)
+                # print("orig_labels: ", orig_labels)
+                # Make sure replacement is not the same as original
+                mask = rand_labels == labels
+                while mask.any():
+                    rand_labels[mask] = torch.randint(1, num_classes + 1, (mask.sum().item(),), device=labels.device)
+                    mask = rand_labels == labels
+                # print("rand_labels: ", rand_labels)
+                scores = evasion_attack_scores(residuals, fingerprints, orig_labels, rand_labels, label_map_inv, DEV)
+                labels = rand_labels
+            elif corruption_type == 2:
+                # --- Adaptive PGD attack ---
+                # Choose random target model (≠ original)
+                target_labels = torch.randint(1, num_classes + 1, labels.size(), device=labels.device)
+                mask = target_labels == labels
+                while mask.any():
+                    target_labels[mask] = torch.randint(1, num_classes + 1, (mask.sum().item(),), device=labels.device)
+                    mask = target_labels == labels
+                
+                filtered_audio = audio_filter.forward(waveforms)
+                avg_ = transformation.forward(waveforms, wavs_len)
+                filtered_avg_ = transformation.forward(filtered_audio, wavs_len)
+                residuals = avg_ - filtered_avg_
+                scores_src = compute_mahalanobis_scores(residuals, fingerprints, DEV)
+
+                # Use stronger attack
+                waveforms_adv = strong_pgd_attack(
+                    waveforms=waveforms,
+                    labels=labels,
+                    fingerprints=fingerprints,
+                    transformation=transformation,
+                    audio_filter=audio_filter,
+                    wavs_len=wavs_len,
+                    label_map_inv=label_map_inv,
+                    epsilon=0.002,
+                    alpha=0.0008,
+                    steps=1000, # 200
+                    targeted=True,
+                    target_labels=target_labels,
+                    device=DEV,
+                    use_momentum=True,
+                    momentum_decay=0.9,
+                    l2_reg=1e-6,
+                    path=path[0],
+                    scale_factor=scale_factor
+                )
+                snr_values.append(SNR(waveforms, waveforms_adv))
+                filtered_audio = audio_filter.forward(waveforms_adv)
+                avg_ = transformation.forward(waveforms_adv, wavs_len)
+                filtered_avg_ = transformation.forward(filtered_audio, wavs_len)
+                residuals = avg_ - filtered_avg_
+                scores = compute_mahalanobis_scores(residuals, fingerprints, DEV)
+                # print(scores)
+                # preds_tensor = assign_vocoders(scores)
+                # print(preds_tensor)
+                # print(waveforms_adv[0].shape)
+                # extract actual string
+                # extract filename
+                filename = os.path.basename(path[0])
+                output_dir_audio = os.path.join("adapt_attack",corpus, str(scale_factor), str(labels[0].item()))
+                os.makedirs(output_dir_audio, exist_ok=True)
+                torchaudio.save(os.path.join(output_dir_audio, filename), waveforms_adv[0].detach().cpu().contiguous(), sample_rate)
+                
+                preds_tensor = assign_vocoders(scores)
+                if preds_tensor != target_labels -1:
+                    csv_path = os.path.join("adapt_attack",corpus, str(scale_factor))
+                    # Create CSV with header if it doesn't exist
+                    with open(f"{csv_path}/failed_files.csv", "a", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(path)   # header
+                    print(path, preds_tensor)
+                '''
+                if path[0] == "/data/DATASETS/ASV_Spoof_2019_LA/ASVspoof2019_LA_dev/flac/LA_D_8169706.flac":
+                    print(path, preds_tensor)
+                    print("label_tgt", target_labels)
+                    print("tgts", scores)
+                    print("label_src", labels)
+                    print("srcs: ", scores_src)
+                    print(agddgd)
+                '''
+                labels = target_labels
+            else:
+                # scores = compute_mahalanobis_scores(residuals, fingerprints, DEV)
+                scores = compute_mahalanobis_scores(residuals, fingerprints, DEV)
+                # print(scores)
+                # fingerprint = self.fingerprint
+                # score = mahalanobis_score(fingerprint, residual, self.invcov)
+                # print(scores)
+            if classification_type == 'binary':
+                preds_tensor = assign_score(scores)
+            else:
+                preds_tensor = assign_vocoders(scores)
+            # print(scores)
+            # print(preds_tensor, labels)
+            # print(preds_tensor)
+            # print(labels , preds_tensor)
+            all_preds.append(preds_tensor)
+            all_labels.append(labels)
+        
+        if corruption_type == 2:
+            avg_SNR = sum(snr_values) / len(snr_values)
+            csv_path = os.path.join("adapt_attack",corpus, str(scale_factor))
+            print("Avg SNR: ", avg_SNR)
+
+            with open(f"{csv_path}/failed_files.csv", "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([avg_SNR])   # header
+                
+
+        # print("Scoring finished.")
+        # Convert predictions and labels to tensors
+        preds_tensor = torch.cat(all_preds, dim=0)
+        labels_tensor = torch.cat(all_labels, dim=0)
+        # print(preds_tensor)
+        # print(labels_tensor)
+        if classification_type == 'binary':
+            fitted_norm = norm.pdf(preds_tensor.cpu(), loc=data_gaussian["mean"][0], scale=data_gaussian["std"][0] + 1e-08)
+            '''
+            # Create AUROC metric object
+            auroc_metric = AUROC(task=task)
+            # Compute AUROC
+            auroc_score = auroc_metric(preds_tensor, labels_tensor)
+            # auc = roc_auc_score(labels, outputs[label] + outputs[key_dict])
+            print("auroc_score", auroc_score)
+            # '''
+            preds_tensor = (fitted_norm >= data_gaussian["best_threshold"][0])
+            # print(preds_tensor)
+            preds_tensor = torch.tensor(preds_tensor, dtype=torch.float).to(DEV) # preds_tensor.astype(float)
+            # print(preds_tensor)
+            '''
+            TP, FP, TN, FN = perf_measure(y_actual, y_hat)
+
+            TPR = TP / (TP + FN)
+            FPR = FP / (TN + FP)
+            acc = (y_hat == y_actual) 
+            precision = TP / (TP + FP)
+            Recall = TP / (TP + FN)
+            F1 = TP / (TP + (FN + FP)/2)
+            return np.mean(acc), TP, FP, TN, FN, FPR, TPR, precision, Recall, F1
+            # '''
+            accuracy = Accuracy(task="binary", num_classes=num_classes).to(DEV)
+            f1 = F1Score(task="binary", num_classes=num_classes, average="macro").to(DEV)
+            precision = Precision(task="binary", num_classes=num_classes, average="macro").to(DEV)
+            recall = Recall(task="binary", num_classes=num_classes, average="macro").to(DEV)
+            confusion_matrix = ConfusionMatrix(task="binary", num_classes=num_classes).to(DEV)
+        else:
+            accuracy = Accuracy(task="multiclass", num_classes=num_classes).to(DEV)
+            f1 = F1Score(task="multiclass", num_classes=num_classes, average="macro").to(DEV)
+            precision = Precision(task="multiclass", num_classes=num_classes, average="macro").to(DEV)
+            recall = Recall(task="multiclass", num_classes=num_classes, average="macro").to(DEV)
+            confusion_matrix = ConfusionMatrix(task="multiclass", num_classes=num_classes).to(DEV)
+            # Shift labels to start from 0
+            labels_tensor = labels_tensor - 1
+        # Update metrics with final tensors
+        accuracy.update(preds_tensor, labels_tensor)
+        precision.update(preds_tensor, labels_tensor)
+        recall.update(preds_tensor, labels_tensor)
+        f1.update(preds_tensor, labels_tensor)
+        confusion_matrix.update(preds_tensor, labels_tensor)        
+        # Compute final metrics
+        accuracy_score = accuracy.compute().item()
+        precision_score = precision.compute().item()
+        recall_score = recall.compute().item()
+        f1_score = f1.compute().item()
+        confusion_matrix_score = confusion_matrix.compute().cpu().numpy()        
+        # Print metrics
+        # '''
+        print(f"Accuracy: {accuracy_score:.4f}")
+        print(f"Precision: {precision_score:.4f}")
+        print(f"Recall: {recall_score:.4f}")
+        print(f"F1 Score: {f1_score:.4f}")
+        print(f"Confusion Matrix:\n{confusion_matrix_score}")        
+        # '''
+        # '''
+        # Save metrics to Excel file
+        metrics_data = {
+            "Metric": ["Accuracy", "Precision", "Recall", "F1 Score"],
+            "Score": [accuracy_score, precision_score, recall_score, f1_score]
+        }
+        metrics_df = pd.DataFrame(metrics_data)
+        # Save confusion matrix to Excel file
+        confusion_matrix_df = pd.DataFrame(confusion_matrix_score)
+        if corruption_type == 1:
+            confusion_matrix_df.to_excel(f'{output_dir}/evasion_confusion_matrix_{corruption_type}_factor{scale_factor}.xlsx', index=True)  
+            metrics_df.to_excel(f'{output_dir}/evasion_testing_scores_{corruption_type}_factor{scale_factor}.xlsx', index=False)
+        elif corruption_type == 2:
+            confusion_matrix_df.to_excel(f'{output_dir}/adapt_attack_confusion_matrix_{corruption_type}_factor{scale_factor}.xlsx', index=True)  
+            metrics_df.to_excel(f'{output_dir}/adapt_attack_testing_scores_{corruption_type}_factor{scale_factor}.xlsx', index=False)
+        else:
+            confusion_matrix_df.to_excel(f'{output_dir}/confusion_matrix_{corruption_type}_factor{scale_factor}.xlsx', index=True)      
+            metrics_df.to_excel(f'{output_dir}/testing_scores_{corruption_type}_factor{scale_factor}.xlsx', index=False)
+        save_heatmap(confusion_matrix_df.to_numpy(), output_dir, classification_type, corruption_type, scale_factor, corpus)
+        print(f'Metrics and confusion matrix saved in {output_dir}.')
+        # '''
+
+def set_bn_to_train(m):
+    if isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
+        m.train()
+        
+if __name__ == "__main__":
+    main()
